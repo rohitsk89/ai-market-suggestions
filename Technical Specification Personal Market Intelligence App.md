@@ -99,17 +99,17 @@ Both use the same Docker Compose files. The difference is where each service run
 
 My recommendation: A if the GPU machine can stay on 24/7, otherwise B. One rule makes both work: workers connect out to Postgres, and Postgres is never exposed to the internet.
 
-### 2.5 Hardware assumptions \[DECISION NEEDED\]
+### 2.5 Hardware assumptions 
 
-- &#91;ASSUMPTION\] A GPU with 24 GB of VRAM, or Apple Silicon with 32 GB or more of unified memory, for a 31B dense model at 4-bit quantization. My estimate is roughly 17 to 20 GB for the weights alone, before the context cache.
-- &#91;ASSUMPTION\] 32 GB of system RAM and a 500 GB SSD.
+- Apple Silicon M5 pro with 48 GB or more of unified memory, for a 31B dense model at 4-bit quantization. My estimate is roughly 17 to 20 GB for the weights alone, before the context cache.
+- 48 GB of system RAM and a 1 TB SSD.
 - Data volume is small. About 10 years of daily bars for roughly 6,000 tickers is on the order of 15 million rows, which one Postgres instance handles easily.
 
 Tell me your real hardware. The throughput plan in 4.13 depends on it.
 
 ### 2.6 Key decisions
 
-- ADR-1, Python backend, TypeScript frontend. Finance, data and LLM libraries are Python-first. Alternatives are Java with Spring Boot or Node with TypeScript. The API contract (OpenAPI) keeps the boundary clean, so a different backend language stays possible, but you would be rebuilding data-science plumbing.
+- ADR-1, Python backend, TypeScript frontend. Finance, data and LLM libraries are Python-first. The API contract (OpenAPI) keeps the boundary clean, so a different backend language stays possible, but you would be rebuilding data-science plumbing.
 - ADR-2, PostgreSQL only: data, job queue and vectors in one database. One thing to back up and one thing to learn.
 - ADR-3, modular monolith, not microservices.
 - ADR-4, every model is reached through one OpenAI-compatible interface (section 4).
@@ -120,33 +120,61 @@ Tell me your real hardware. The throughput plan in 4.13 depends on it.
 
 ## 3. Technology stack
 
-All free and open source. \[VERIFY\] I checked the licenses for Gemma 4, Procrastinate and LiteLLM. The rest are from my knowledge, so run the CI license scan (section 13) before you rely on them.
+Backend
 
-| Layer | Choice | License |
+| Layer	| Pick | Why
 | --- | --- | --- |
-| Language | Python 3.12 or newer | PSF |
-| API framework | FastAPI, Uvicorn, Pydantic v2 | MIT / BSD / MIT |
-| Database | PostgreSQL, pgvector | PostgreSQL License |
-| DB access | SQLAlchemy 2, Alembic, psycopg 3 | MIT / MIT / LGPL-3.0 |
-| Job queue and scheduler | Procrastinate (Postgres-based, periodic tasks, retries, locks) | MIT |
-| Data processing | Polars, NumPy (pandas where needed) | MIT / BSD |
-| HTTP and resilience | httpx, tenacity, aiolimiter | BSD / Apache-2.0 / MIT |
-| Feeds | feedparser | BSD |
-| Prompt templates | Jinja2 | BSD |
-| LLM client | OpenAI Python SDK, pointed at any OpenAI-compatible server | Apache-2.0 |
-| Optional LLM router | LiteLLM proxy (fallbacks, routing) | MIT (open core) |
-| LLM servers | Ollama, llama.cpp (llama-server), vLLM | MIT / MIT / Apache-2.0 |
-| Default model | Gemma 4 31B | Apache-2.0 |
-| Frontend | React, TypeScript, Vite | MIT |
-| Frontend libraries | TanStack Query, React Router, Tailwind CSS, shadcn/ui | MIT |
-| Charts | TradingView Lightweight Charts (price), Recharts or ECharts (the rest) | Apache-2.0 / MIT / Apache-2.0 |
-| Auth | py\_webauthn (passkeys), pyotp (TOTP), argon2-cffi | BSD / MIT / MIT |
-| Reverse proxy | Caddy (automatic HTTPS) | Apache-2.0 |
-| Containers | Docker Engine and Compose, or Podman | Apache-2.0 |
-| Secrets and backups | SOPS with age, restic | MPL-2.0 and BSD / BSD |
-| Logs and metrics | structlog; optional Prometheus and Grafana; optional self-hosted Langfuse for LLM traces | MIT / Apache-2.0 and AGPL-3.0 / MIT |
-| Testing | pytest, hypothesis, respx, Playwright, optional promptfoo | MIT / MPL-2.0 / BSD / Apache-2.0 / MIT |
-| Lint and types | ruff, mypy, ESLint, Prettier | MIT |
+| Language	| Python 3.13	| edgartools (MIT) already parses financials, 8-K items, Form 4 insiders, 13F and N-PORT fund holdings. That covers most of the PRD’s data needs. |
+| API	| FastAPI with Pydantic v2	| Generates an OpenAPI spec, so the frontend client is typed automatically. |
+| Database	| PostgreSQL 18	| --- |
+| DB access	| SQLAlchemy 2, Alembic, psycopg 3	| One driver, shared with the job queue. |
+| Jobs and scheduling	| Procrastinate	| Runs on Postgres, so no Redis. Has periodic tasks, priorities and retries. It’s actively released, but the project is asking for maintainers. |
+| Number crunching	| pandas and NumPy	| edgartools returns pandas, and the data is small, so a second dataframe library isn’t worth it. |
+| HTTP, retries, rate limits	| httpx, tenacity, aiolimiter	| Small and standard. |
+| Feeds, calendar, prompts	| feedparser, exchange_calendars, Jinja2	| The calendar handles NYSE holidays and trading days. |
+| Tooling	| uv, ruff, pyright	|
+
+Data sources
+
+Need	Pick	Why
+Filings, fundamentals, insiders, ETF holdings	SEC EDGAR via edgartools	Official, with a limit of 10 requests per second.
+Prices and the S&P proxy (SPY)	Alpaca Basic, called with plain httpx	The only free option with multi-symbol batch bars at a workable rate.
+Macro	FRED	Free key.
+News	SEC, Fed and Treasury feeds, then publisher RSS via feedparser	I’ll choose the RSS publishers in the first spike.
+
+On Alpaca, the free default feed is IEX, which is about 2.5% of market volume. You must request feed=sip explicitly. Its docs say historical SIP queries work without a subscription if the end time is at least 15 minutes old, but I found conflicting statements, so test this in week one.
+
+LLM layer
+
+Layer	Pick	Why
+Server	Ollama	Fastest model swapping (ollama pull, change a name). Supports JSON-schema output and thinking control over its OpenAI-compatible API.
+Client	OpenAI Python SDK	Only the base URL changes between servers.
+Default model	Gemma 4 31B (gemma4:31b)	Apache 2.0, 256K context.
+
+If you ever need more control, llama.cpp is the escape hatch, with no app changes.
+
+Frontend
+
+Layer	Pick
+Framework	React, TypeScript, Vite (single-page app)
+Routing and server state	React Router, TanStack Query (no Redux)
+UI and forms	Tailwind, shadcn/ui, React Hook Form with Zod
+API client	openapi-typescript with openapi-fetch
+Charts	Lightweight Charts v5 only. Allocation bars are plain CSS. It’s Apache-2.0 but requires a TradingView attribution link.
+Lint and format	Biome (replaces ESLint and Prettier)
+Packages	pnpm
+
+Ops, security, quality
+
+Layer	Pick
+Remote access	Tailscale, free Personal plan
+Proxy and TLS	Caddy
+Login	Passkeys (WebAuthn) plus recovery codes
+Containers	Docker Compose
+Backups	restic (encrypts by itself) on a nightly pg_dump
+Logging	structlog JSON, plus the admin status page
+Tests	pytest, hypothesis, respx, Vitest, Playwright, and an in-house LLM eval harness
+CI and scanning	GitHub Actions, OSV-Scanner
 
 Dependency policy:
 
@@ -900,12 +928,9 @@ Contrast to WCAG AA, full keyboard navigation, text alternatives that summarize 
 
 Internet scanners, a lost or stolen phone or laptop, malicious text in news or filings (prompt injection), a compromised dependency, portfolio data leaking to a remote model, and plain data loss. Multi-tenant isolation is not a concern, since there is one household.
 
-### 10.2 Access and network \[DECISION NEEDED\]
+### 10.2 Access and network
 
-- Option A, private network: reach the app only over a WireGuard-based private network (self-hosted Headscale, or the free Tailscale clients). No public port at all. Each family device installs a small client. Strongest, and still reachable from anywhere.
-- Option B, public HTTPS: Caddy with automatic certificates, strong authentication, and rate limiting, optionally behind a free tunnel service. Easier for family members, a larger attack surface.
-
-My recommendation is A. Choose B only if installing a client on every device is a problem.
+- public HTTPS: Caddy with automatic certificates, strong authentication, and rate limiting, optionally behind a free tunnel service. Easier for family members, a larger attack surface.
 
 ### 10.3 Authentication
 
